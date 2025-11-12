@@ -1,31 +1,64 @@
-name: CI - Cypress -> AWS
+name: Cypress AWS CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   pull_request:
-    branches: [ main ]
 
 permissions:
   contents: read
-  id-token: write   # required for OIDC
+  id-token: write        # required for GitHub OIDC
+  security-events: write
+  actions: read
 
 env:
   AWS_REGION: ap-south-1
   S3_BUCKET: tejas-48portal-artifacts
   SNS_TOPIC_ARN: arn:aws:sns:ap-south-1:976522647233:cypress-build-notifications
+  CODEBUILD_PROJECT: tejas-cypresscode
 
 jobs:
-  run-cypress:
+
+  # -----------------------------
+  # 1. Static Code Analysis (CodeQL)
+  # -----------------------------
+  static-analysis:
+    name: Static Code Analysis (CodeQL)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
         with:
-          node-version: 18
+          languages: javascript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+
+  # -----------------------------
+  # 2. Run Cypress Tests
+  # -----------------------------
+  cypress-tests:
+    name: Run Cypress Tests
+    runs-on: ubuntu-latest
+    needs: static-analysis
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
 
       - name: Cache node modules
         uses: actions/cache@v4
@@ -38,40 +71,137 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Configure AWS credentials (OIDC assume role)
+      - name: Run Cypress tests
+        # keep test failures visible; if you want pipeline to continue regardless, add continue-on-error: true
+        run: npx cypress run --config baseUrl="https://www.google.com"
+
+      - name: Verify artifact contents
+        run: |
+          echo "Listing contents of cypress report folders"
+          ls -R cypress || true
+
+      - name: Upload Cypress Test Reports (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-reports
+          path: |
+            cypress/reports/
+            cypress/screenshots/
+            cypress/videos/
+
+
+  # -----------------------------
+  # 3. Upload Reports to AWS S3
+  # -----------------------------
+  upload-to-s3:
+    name: Upload Test Reports to S3
+    runs-on: ubuntu-latest
+    needs: cypress-tests
+
+    steps:
+      - name: Download Test Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cypress-reports
+          path: reports-artifact
+
+      - name: Verify artifact after download
+        run: |
+          echo "Listing downloaded artifact folder"
+          ls -R reports-artifact || true
+
+      - name: Configure AWS credentials (OIDC assume-role)
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
-
-      - name: Run Cypress tests (headless)
-        # Do NOT swallow errors here so the job fails on test failure.
-        run: npx cypress run --browser chrome --headless
-
-      - name: Upload Cypress videos and screenshots to S3
-        if: always()
+      - name: Upload reports to S3
         run: |
-          echo "Uploading screenshots and videos to S3..."
-          aws s3 cp cypress/videos/ s3://${S3_BUCKET}/videos/ --recursive || echo "no videos found or upload failed"
-          aws s3 cp cypress/screenshots/ s3://${S3_BUCKET}/screenshots/ --recursive || echo "no screenshots found or upload failed"
+          # artifact layout: reports-artifact/cypress/reports, /cypress/screenshots, /cypress/videos
+          if [ -d "reports-artifact/cypress/reports" ]; then
+            aws s3 cp reports-artifact/cypress/reports s3://${S3_BUCKET}/reports/ --recursive || echo "upload reports failed"
+          else
+            echo "reports folder not found"
+          fi
 
-      - name: Publish success notification to SNS
-        if: success()
+          if [ -d "reports-artifact/cypress/screenshots" ]; then
+            aws s3 cp reports-artifact/cypress/screenshots s3://${S3_BUCKET}/screenshots/ --recursive || echo "upload screenshots failed"
+          else
+            echo "screenshots folder not found"
+          fi
+
+          if [ -d "reports-artifact/cypress/videos" ]; then
+            aws s3 cp reports-artifact/cypress/videos s3://${S3_BUCKET}/videos/ --recursive || echo "upload videos failed"
+          else
+            echo "videos folder not found"
+          fi
+
+      - name: List uploaded S3 keys (debug)
         run: |
+          aws s3 ls s3://${S3_BUCKET}/ --recursive | head -n 50 || true
+
+
+  # -----------------------------
+  # 4. Trigger AWS CodeBuild
+  # -----------------------------
+  trigger-codebuild:
+    name: Trigger CodeBuild Project
+    runs-on: ubuntu-latest
+    needs: upload-to-s3
+
+    steps:
+      - name: Configure AWS credentials (OIDC assume-role)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start CodeBuild
+        run: |
+          echo "Starting CodeBuild project: ${CODEBUILD_PROJECT}"
+          aws codebuild start-build --project-name "${CODEBUILD_PROJECT}" --region ${AWS_REGION}
+
+
+  # -----------------------------
+  # 5. Notify via AWS SNS (with presigned URL)
+  # -----------------------------
+  sns-notification:
+    name: Send SNS Notification
+    runs-on: ubuntu-latest
+    needs: trigger-codebuild
+
+    steps:
+      - name: Configure AWS credentials (OIDC assume-role)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: (Optional) Generate S3 presigned URL for index.html report
+        id: generate_url
+        run: |
+          # change path if your report entrypoint differs
+          REPORT_KEY="reports/index.html"
+          if aws s3api head-object --bucket ${S3_BUCKET} --key "${REPORT_KEY}" >/dev/null 2>&1; then
+            url=$(aws s3 presign s3://${S3_BUCKET}/${REPORT_KEY} --expires-in 604800)
+            echo "REPORT_URL=${url}" >> $GITHUB_ENV
+            echo "Found report; presigned URL created"
+          else
+            echo "REPORT_URL=" >> $GITHUB_ENV
+            echo "Report not found; skipping presign"
+          fi
+
+      - name: Send SNS notification
+        run: |
+          if [ -z "${REPORT_URL}" ]; then
+            MESSAGE="✅ Cypress CI/CD Pipeline completed. Artifacts uploaded to s3://${S3_BUCKET}/ (no index.html found)"
+          else
+            MESSAGE="✅ Cypress CI/CD Pipeline completed. View report: ${REPORT_URL}"
+          fi
+
           aws sns publish \
-            --region ${AWS_REGION} \
             --topic-arn "${SNS_TOPIC_ARN}" \
-            --subject "✅ Cypress build succeeded: ${{ github.repository }}" \
-            --message "Branch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nRun: ${{ github.run_url }}"
+            --message "$MESSAGE" \
+            --region ${AWS_REGION}
 
-      - name: Publish failure notification to SNS
-        if: failure()
-        run: |
-          aws sns publish \
-            --region ${AWS_REGION} \
-            --topic-arn "${SNS_TOPIC_ARN}" \
-            --subject "❌ Cypress build FAILED: ${{ github.repository }}" \
-            --message "Branch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nRun: ${{ github.run_url }}"
