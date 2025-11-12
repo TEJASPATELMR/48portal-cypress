@@ -4,15 +4,19 @@ phases:
   install:
     runtime-versions:
       nodejs: 18
-    commands:
-      - echo "Installing project dependencies..."
+      commands:
+      - echo "Installing nvm + Node 18.16.0 to lock minor version"
+      - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+      - export NVM_DIR="$HOME/.nvm"
+      - . "$NVM_DIR/nvm.sh"
+      - nvm install 18.16.0
+      - nvm use 18.16.0
+      - node -v
       - npm ci
-      - npx cypress verify
   build:
     commands:
       - echo "Running Cypress tests..."
       - npx cypress run --browser chrome --headless || true
-
 artifacts:
   files:
     - cypress/videos/**/*
