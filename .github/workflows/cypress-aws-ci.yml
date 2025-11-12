@@ -26,7 +26,6 @@ jobs:
   static-analysis:
     name: Static Code Analysis (CodeQL)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -71,23 +70,56 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run Cypress tests
-        # keep test failures visible; if you want pipeline to continue regardless, add continue-on-error: true
-        run: npx cypress run --config baseUrl="https://www.google.com"
-
-      - name: Verify artifact contents
+      - name: Check staging health
+        # quick fail if staging unreachable (helps debugging)
         run: |
-          echo "Listing contents of cypress report folders"
-          ls -R cypress || true
+          echo "Checking staging URL..."
+          curl -I --max-time 15 https://staging.48.ie || (echo "Staging unreachable"; exit 1)
+
+      - name: Run Cypress tests
+        # rely on cypress.config.js baseUrl (do not override)
+        # If you want Cypress failures to not stop later jobs, add `continue-on-error: true`
+        run: npx cypress run
+
+      - name: Verify artifact contents (local)
+        run: |
+          echo "Listing contents of cypress folder (for debug)"
+          ls -la cypress || true
+
+      # Collect and upload artifact (guarantee artifact exists)
+      - name: Collect Cypress outputs
+        if: always()
+        run: |
+          mkdir -p artifact/cypress-reports
+
+          if [ -d "cypress/reports" ]; then
+            mkdir -p artifact/cypress-reports/reports
+            cp -r cypress/reports/* artifact/cypress-reports/reports/ || true
+          fi
+
+          if [ -d "cypress/screenshots" ]; then
+            mkdir -p artifact/cypress-reports/screenshots
+            cp -r cypress/screenshots/* artifact/cypress-reports/screenshots/ || true
+          fi
+
+          if [ -d "cypress/videos" ]; then
+            mkdir -p artifact/cypress-reports/videos
+            cp -r cypress/videos/* artifact/cypress-reports/videos/ || true
+          fi
+
+          # ensure artifact always contains at least one file so the upload succeeds
+          if [ -z "$(ls -A artifact/cypress-reports || true)" ]; then
+            echo "No Cypress outputs were generated in this run." > artifact/cypress-reports/README.txt
+          fi
 
       - name: Upload Cypress Test Reports (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cypress-reports
-          path: |
-            cypress/reports/
-            cypress/screenshots/
-            cypress/videos/
+          path: artifact/cypress-reports/**/*
+          if-no-files-found: error
+          retention-days: 7
 
 
   # -----------------------------
@@ -103,12 +135,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: cypress-reports
-          path: reports-artifact
+          path: artifact   # will create artifact/cypress-reports/...
 
       - name: Verify artifact after download
         run: |
           echo "Listing downloaded artifact folder"
-          ls -R reports-artifact || true
+          ls -R artifact || true
 
       - name: Configure AWS credentials (OIDC assume-role)
         uses: aws-actions/configure-aws-credentials@v2
@@ -118,23 +150,27 @@ jobs:
 
       - name: Upload reports to S3
         run: |
-          # artifact layout: reports-artifact/cypress/reports, /cypress/screenshots, /cypress/videos
-          if [ -d "reports-artifact/cypress/reports" ]; then
-            aws s3 cp reports-artifact/cypress/reports s3://${S3_BUCKET}/reports/ --recursive || echo "upload reports failed"
+          # uploaded artifact layout: artifact/cypress-reports/{reports|screenshots|videos|README.txt}
+          if [ -d "artifact/cypress-reports/reports" ]; then
+            aws s3 cp artifact/cypress-reports/reports s3://${S3_BUCKET}/reports/ --recursive || echo "upload reports failed"
           else
             echo "reports folder not found"
           fi
 
-          if [ -d "reports-artifact/cypress/screenshots" ]; then
-            aws s3 cp reports-artifact/cypress/screenshots s3://${S3_BUCKET}/screenshots/ --recursive || echo "upload screenshots failed"
+          if [ -d "artifact/cypress-reports/screenshots" ]; then
+            aws s3 cp artifact/cypress-reports/screenshots s3://${S3_BUCKET}/screenshots/ --recursive || echo "upload screenshots failed"
           else
             echo "screenshots folder not found"
           fi
 
-          if [ -d "reports-artifact/cypress/videos" ]; then
-            aws s3 cp reports-artifact/cypress/videos s3://${S3_BUCKET}/videos/ --recursive || echo "upload videos failed"
+          if [ -d "artifact/cypress-reports/videos" ]; then
+            aws s3 cp artifact/cypress-reports/videos s3://${S3_BUCKET}/videos/ --recursive || echo "upload videos failed"
           else
             echo "videos folder not found"
+          fi
+
+          if [ -f "artifact/cypress-reports/README.txt" ]; then
+            aws s3 cp artifact/cypress-reports/README.txt s3://${S3_BUCKET}/README.txt || true
           fi
 
       - name: List uploaded S3 keys (debug)
@@ -181,7 +217,6 @@ jobs:
       - name: (Optional) Generate S3 presigned URL for index.html report
         id: generate_url
         run: |
-          # change path if your report entrypoint differs
           REPORT_KEY="reports/index.html"
           if aws s3api head-object --bucket ${S3_BUCKET} --key "${REPORT_KEY}" >/dev/null 2>&1; then
             url=$(aws s3 presign s3://${S3_BUCKET}/${REPORT_KEY} --expires-in 604800)
@@ -204,4 +239,3 @@ jobs:
             --topic-arn "${SNS_TOPIC_ARN}" \
             --message "$MESSAGE" \
             --region ${AWS_REGION}
-
