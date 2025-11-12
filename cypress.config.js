@@ -1,14 +1,24 @@
-
 const { defineConfig } = require('cypress');
 
 module.exports = defineConfig({
   e2e: {
-    baseUrl: 'https://www.google.com/s',
+    // point to your app root — tests should visit paths like '/log-in'
+    baseUrl: 'https://staging.48.ie',
+
+    // keep spec pattern
     specPattern: 'cypress/e2e/**/*.spec.js',
+
+    // your support file (leave as-is if it exists)
     supportFile: 'cypress/support/e2e.js',
-    defaultCommandTimeout: 15000,
+
+    // timeouts tuned for CI
+    pageLoadTimeout: 120000,        // wait up to 120s for page load
+    requestTimeout: 15000,          // network request timeout
+    defaultCommandTimeout: 15000,   // your existing command timeout
+
     viewportWidth: 1280,
     viewportHeight: 900,
+
     setupNodeEvents(on, config) {
       // simple task to print logs from the spec to the terminal
       on('task', {
