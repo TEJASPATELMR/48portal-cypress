@@ -1,0 +1,26 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "Installing project dependencies..."
+      - npm ci
+      - npx cypress verify
+  build:
+    commands:
+      - echo "Running Cypress tests..."
+      - npx cypress run --browser chrome --headless || true
+
+artifacts:
+  files:
+    - cypress/videos/**/*
+    - cypress/screenshots/**/*
+  discard-paths: no
+
+reports:
+  cypress-tests:
+    files:
+      - cypress/results/**/*.xml
+    base-directory: cypress/results

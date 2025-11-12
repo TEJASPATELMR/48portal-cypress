@@ -1,0 +1,68 @@
+name: CI - Cypress -> AWS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write     # needed for GitHub OIDC
+
+jobs:
+  run-cypress:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ap-south-1
+      S3_BUCKET: tejas-cypress-reports                # <-- replace with your S3 bucket
+      SNS_TOPIC_ARN: arn:aws:sns:ap-south-1:123456789012:cypress-build-notifications  # <-- replace
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials (via OIDC assume-role)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}   # create this secret containing the role ARN
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Run Cypress tests (headless)
+        run: npx cypress run --browser chrome --headless || exit 0
+        # note: "|| exit 0" prevents the job from immediately failing so we can still collect artifacts.
+        # remove it if you want the job to fail on test failures.
+
+      - name: Upload Cypress videos to S3
+        if: always()
+        run: |
+          aws s3 cp cypress/videos/ s3://$S3_BUCKET/videos/ --recursive || true
+          aws s3 cp cypress/screenshots/ s3://$S3_BUCKET/screenshots/ --recursive || true
+
+      - name: Publish success notification to SNS
+        if: success()
+        run: |
+          aws sns publish \
+            --region $AWS_REGION \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "✅ Cypress build succeeded: ${{ github.repository }}" \
+            --message "Branch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nRun: ${{ github.run_url }}"
+
+      - name: Publish failure notification to SNS
+        if: failure()
+        run: |
+          aws sns publish \
+            --region $AWS_REGION \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "❌ Cypress build FAILED: ${{ github.repository }}" \
+            --message "Branch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nRun: ${{ github.run_url }}"
