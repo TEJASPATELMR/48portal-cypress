@@ -3,7 +3,7 @@ const { defineConfig } = require('cypress');
 
 module.exports = defineConfig({
   e2e: {
-    baseUrl: 'https://staging.48.ie/log-in',
+    // baseUrl: 'https://staging.48.ie/log-in',
     specPattern: 'cypress/e2e/**/*.spec.js',
     supportFile: 'cypress/support/e2e.js',
     defaultCommandTimeout: 15000,
